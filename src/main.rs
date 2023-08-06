@@ -1,156 +1,136 @@
-use std::sync::Arc;
-use std::time::Duration;
-
-struct State {
-    _x: Arc<String>,
-}
-
-mod app {
-    use actix_web::{post, web, HttpResponse, Responder};
-
-    #[post("/echo")]
-    async fn echo(_req_body: web::Json<String>) -> impl Responder {
-        HttpResponse::Ok().body("xxx")
-    }
-}
-
-// #[actix_web::main]
-// async fn main() -> std::io::Result<()> {
-//     let x: Arc<String> = Arc::new(String::from("x"));
-//
-//     HttpServer::new({
-//         let x = x.clone();
-//         move || {
-//             App::new()
-//                 .app_data(JsonConfig::default().limit(1024 * 1024))
-//                 .app_data(web::Data::new(State { _x: x.clone() }))
-//                 .service(hello)
-//                 .service(echo)
-//                 .route("/hey", web::get().to(manual_hello))
-//         }
-//     })
-//     .bind(("127.0.0.1", 8080))?
-//     .run()
-//     .await?;
-//
-//     let xx = Arc::downgrade(&x);
-//     drop(x);
-//     let xx = xx.upgrade();
-//     println!("{:?}", xx);
-//
-//     Ok(())
-// }
-
-#[actix_web::main]
-async fn main() -> std::io::Result<()> {
-    use actix_web::{rt, web, App, HttpServer};
-
-    let x: Arc<String> = Arc::new(String::from("x"));
-
-    let data = web::Data::new(State { _x: x.clone() });
-    HttpServer::new(move || {
-        App::new()
-            .app_data(actix_web::web::JsonConfig::default().limit(1024 * 1024))
-            .app_data(data.clone())
-            .service(app::echo)
-    })
-    .shutdown_timeout(5)
-    .bind(("127.0.0.1", 8080))?
-    .run()
-    .await?;
-
-    let xx = Arc::downgrade(&x);
-    drop(x);
-
-    let a1: Option<String> = xx.upgrade().map(|x| x.as_ref().clone());
-    rt::time::sleep(Duration::from_secs(5)).await;
-    let a2: Option<String> = xx.upgrade().map(|x| x.as_ref().clone());
-
-    println!("{:?} {:?}", a1, a2);
-    Ok(())
-}
+fn main() {}
 
 #[cfg(test)]
 mod test {
-    use super::*;
+    use std::convert::Infallible;
+    use std::sync::Arc;
+    use std::time::Duration;
 
+    use actix_web::{rt, web, App, HttpServer};
+    use anyhow::bail;
     use reqwest::Client;
+    use tokio::join;
     use tokio::sync::mpsc;
-    use tokio::time::sleep;
     use tokio_stream::wrappers::ReceiverStream;
 
-    #[actix_web::main]
-    async fn server() -> std::io::Result<()> {
-        use actix_web::{rt, web, App, HttpServer};
-
-        let x: Arc<String> = Arc::new(String::from("x"));
-
-        let data = web::Data::new(State { _x: x.clone() });
-        HttpServer::new(move || {
-            App::new()
-                .app_data(actix_web::web::JsonConfig::default().limit(1024 * 1024))
-                .app_data(data.clone())
-                .service(app::echo)
-        })
-        .shutdown_timeout(5)
-        .bind(("127.0.0.1", 8080))?
-        .run()
-        .await?;
-
-        let xx = Arc::downgrade(&x);
-        drop(x);
-
-        let a1: Option<String> = xx.upgrade().map(|x| x.as_ref().clone());
-        rt::time::sleep(Duration::from_secs(5)).await;
-        let a2: Option<String> = xx.upgrade().map(|x| x.as_ref().clone());
-
-        println!("{:?} {:?}", a1, a2);
-        Ok(())
+    struct State {
+        _x: Arc<String>,
     }
 
-    #[test]
-    fn test_1() -> anyhow::Result<()> {
-        let t1 = std::thread::spawn(|| super::main());
-        std::thread::sleep(Duration::from_millis(500));
-        let t2 = std::thread::spawn(|| xxx());
-        t1.join().map_err(std::panic::resume_unwind)??;
-        t2.join().map_err(std::panic::resume_unwind)??;
-        // sleep(Duration::from_millis(500)).await;
-        Ok(())
+    mod app {
+        use actix_web::{post, web, HttpResponse, Responder};
+
+        #[post("/echo")]
+        async fn echo(_req_body: web::Json<String>) -> impl Responder {
+            HttpResponse::Ok().body("xxx")
+        }
     }
 
-    #[tokio::main]
-    async fn xxx() -> anyhow::Result<()> {
-        // Create a Reqwest client
+    enum ReqSpeed {
+        Fast,
+        Slow,
+    }
+
+    #[actix_web::test]
+    async fn test_slow_request() -> anyhow::Result<()> {
+        test_data_leak(Some(ReqSpeed::Slow)).await
+    }
+
+    #[actix_web::test]
+    async fn test_fast_request() -> anyhow::Result<()> {
+        test_data_leak(Some(ReqSpeed::Fast)).await
+    }
+
+    #[actix_web::test]
+    async fn test_no_request() -> anyhow::Result<()> {
+        test_data_leak(None).await
+    }
+
+    async fn test_data_leak(req: Option<ReqSpeed>) -> anyhow::Result<()> {
+        let (x_weak, data) = {
+            let x: Arc<String> = Arc::new(String::from("x"));
+            (Arc::downgrade(&x), web::Data::new(State { _x: x }))
+        };
+
+        mod app {
+            use actix_web::{post, web, HttpResponse, Responder};
+
+            #[post("/echo")]
+            async fn echo(_req_body: web::Json<String>) -> impl Responder {
+                HttpResponse::Ok().body("xxx")
+            }
+        }
+
+        {
+            let server = HttpServer::new(move || {
+                App::new()
+                    .app_data(actix_web::web::JsonConfig::default().limit(1024 * 1024))
+                    .app_data(data.clone())
+                    .service(app::echo)
+            })
+            .shutdown_timeout(2)
+            .bind(("127.0.0.1", 0))?;
+            let port = server.addrs()[0].port();
+            let server = server.run();
+            let server_handle = server.handle();
+
+            let send_request = async move {
+                rt::time::sleep(Duration::from_secs_f64(0.1)).await;
+                if let Some(speed) = req {
+                    request(format!("http://127.0.0.1:{}/echo", port), speed).await?;
+                }
+                Ok::<_, anyhow::Error>(())
+            };
+
+            let graceful_stop = async move {
+                rt::time::sleep(Duration::from_secs(1)).await;
+                server_handle.stop(/* graceful */ true).await;
+            };
+
+            let (server_res, _slow_req_res, ()) = join!(server, send_request, graceful_stop);
+            server_res?;
+        }
+
+        for _ in 0..20 {
+            rt::time::sleep(Duration::from_secs_f64(0.1)).await;
+            if x_weak.upgrade().is_none() {
+                return Ok(());
+            }
+        }
+
+        bail!("x: Arc<String> is still referenced somewhere :-(");
+    }
+
+    async fn request(url: String, speed: ReqSpeed) -> anyhow::Result<()> {
         let client = Client::new();
 
-        // Create a channel to simulate a slow network
-        let (tx, rx) = mpsc::channel(32);
+        let req = client.post(url).header("Content-Type", "application/json");
 
-        // Start a separate task to simulate the slow network
-        tokio::spawn(async move {
-            for _ in 0..60 {
-                sleep(Duration::from_millis(500)).await;
-                tx.send(Ok::<_, std::convert::Infallible>(vec![0u8; 1024]))
-                    .await
-                    .unwrap();
+        match speed {
+            ReqSpeed::Fast => {
+                let req = req.body("\"x\"");
+                req.send().await?;
             }
-        });
+            ReqSpeed::Slow => {
+                let (body_tx, body_rx) = mpsc::channel(32);
+                let slow_body = async move {
+                    for _ in 0..60 {
+                        rt::time::sleep(Duration::from_millis(500)).await;
+                        body_tx.send(Ok::<_, Infallible>(vec![0u8; 1024])).await?;
+                    }
+                    Ok::<_, anyhow::Error>(())
+                };
 
-        // Prepare the request
-        let request = client
-            .post("http://127.0.0.1:8080/echo")
-            .header("Content-Type", "application/json")
-            .body(reqwest::Body::wrap_stream(ReceiverStream::new(rx)));
+                let req = req.body(reqwest::Body::wrap_stream(ReceiverStream::new(body_rx)));
+                let response = req.send();
 
-        // Send the request and wait for the response
-        let _ = request.send().await;
-
-        // let response_text = response.text().await?;
-        // println!("Response: {}", response_text);
+                // Await the response and body generator
+                let (response_res, slow_body_res) = join!(response, slow_body);
+                response_res?;
+                slow_body_res?;
+            }
+        }
 
         Ok(())
     }
 }
-
-// dd if=/dev/zero count=10 bs=8K | jq -R . | curl --limit-rate 1K --json @- http://localhost:8080/echo
